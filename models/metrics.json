@@ -1,0 +1,41 @@
+[
+  {
+    "assay": "SR-p53",
+    "pr_auc": 0.298,
+    "roc_auc": 0.8036,
+    "f1": 0.342,
+    "precision": 0.3056,
+    "recall": 0.3882,
+    "threshold": 0.575,
+    "tp": 33,
+    "fp": 75,
+    "tn": 1194,
+    "fn": 52
+  },
+  {
+    "assay": "SR-ARE",
+    "pr_auc": 0.5277,
+    "roc_auc": 0.823,
+    "f1": 0.5283,
+    "precision": 0.5355,
+    "recall": 0.5213,
+    "threshold": 0.6346,
+    "tp": 98,
+    "fp": 85,
+    "tn": 892,
+    "fn": 90
+  },
+  {
+    "assay": "SR-HSE",
+    "pr_auc": 0.2223,
+    "roc_auc": 0.7416,
+    "f1": 0.321,
+    "precision": 0.2955,
+    "recall": 0.3514,
+    "threshold": 0.5471,
+    "tp": 26,
+    "fp": 62,
+    "tn": 1156,
+    "fn": 48
+  }
+]
