@@ -1,17 +1,17 @@
 """
-Phase 4 — ToxPathGuard Prediction Layer
------------------------------------------
-Accepts a SMILES string and runs it through all three trained XGBoost
-classifiers to produce a structured toxicity risk audit.
+Phase 4.1 — ToxPathGuard Prediction Layer (Updated)
+------------------------------------------------------
+Integrates the three XGBoost agents with the structural alert module,
+applicability-domain check, and the coordinator reasoning layer.
 
-This module is the single integration point between the raw molecule
-input and every downstream consumer (CLI, Streamlit UI, SHAP explainer).
-Nothing above this layer should ever touch model files or featurisation
-logic directly.
+This is the single integration point for all downstream consumers
+(CLI, Streamlit UI, SHAP explainer in Phase 5).
 
-Usage (CLI test mode):
+Usage:
     python src/predict.py --smiles "CCO"
     python src/predict.py --smiles "c1ccc2c(c1)cc1ccc3cccc4ccc2c1c34"
+    python src/predict.py --smiles "c1ccc(N)cc1"   # aniline — aromatic amine
+    python src/predict.py --smiles "this-is-not-a-molecule"
 """
 
 import os
@@ -21,63 +21,47 @@ import pickle
 import argparse
 import numpy as np
 
-# We deliberately import from our own features module so the featurisation
-# path is exactly identical to what was used during training. Any drift
-# between training features and prediction features would silently produce
-# wrong probabilities — this import makes that impossible.
-from features import smiles_to_mol, featurise_molecule, feature_names
+# ── Internal imports (same-directory modules) ──────────────────────────────────
+# Running from the project root requires src/ on the path.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
+from features  import smiles_to_mol, featurise_molecule, feature_names
+from alerts    import check_structural_alerts, has_any_alert
+from domain    import check_domain, MORGAN_NBITS
+from reasoner  import run_coordinator, SAFETY_THRESHOLDS
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-# Default paths — can be overridden if the project moves.
-DEFAULT_MODELS_DIR    = "models"
-DEFAULT_REPORT_PATH   = os.path.join(DEFAULT_MODELS_DIR, "training_report.json")
+DEFAULT_MODELS_DIR   = "models"
+DEFAULT_REPORT_PATH  = os.path.join(DEFAULT_MODELS_DIR, "training_report.json")
+DEFAULT_DOMAIN_NPZ   = os.path.join("data", "processed", "SR_p53.npz")
 
-# Maps each assay to its model filename and human-readable pathway label.
-# This is the single source of truth for agent identity in the prediction layer.
 AGENT_CONFIG = {
     "SR-p53": {
-        "agent_name":  "Agent 1 — DNA / Genotoxic Stress",
-        "model_file":  "agent_p53.pkl",
+        "agent_name": "Agent 1 — DNA / Genotoxic Stress",
+        "model_file": "agent_p53.pkl",
     },
     "SR-ARE": {
-        "agent_name":  "Agent 2 — Oxidative Stress",
-        "model_file":  "agent_are.pkl",
+        "agent_name": "Agent 2 — Oxidative Stress",
+        "model_file": "agent_are.pkl",
     },
     "SR-HSE": {
-        "agent_name":  "Agent 3 — Cellular / Heat-Shock Stress",
-        "model_file":  "agent_hse.pkl",
+        "agent_name": "Agent 3 — Cellular / Heat-Shock Stress",
+        "model_file": "agent_hse.pkl",
     },
 }
-
-# Verdict thresholds applied to the *maximum* probability across all agents.
-# These are narrative thresholds for the overall verdict, separate from the
-# per-assay decision thresholds which come from training_report.json.
-VERDICT_HIGH_RISK = 0.60
-VERDICT_CAUTION   = 0.35
 
 
 # ── Model and Threshold Loading ────────────────────────────────────────────────
 
 def load_models(models_dir: str = DEFAULT_MODELS_DIR) -> dict:
-    """
-    Loads all three trained XGBoost classifiers from disk into a dictionary
-    keyed by assay name. Raises a clear FileNotFoundError immediately if any
-    model is missing, rather than failing silently mid-prediction.
-
-    We load all three models once at startup rather than re-loading per
-    prediction call. When the Streamlit app uses this module, it will call
-    load_models() once outside the prediction function and pass the result
-    in — this avoids re-reading files from disk on every user interaction.
-    """
     models = {}
     for assay, cfg in AGENT_CONFIG.items():
         path = os.path.join(models_dir, cfg["model_file"])
         if not os.path.exists(path):
             raise FileNotFoundError(
-                f"Model file not found: '{path}'\n"
-                f"Run src/train.py first (Phase 3) to generate trained models."
+                f"Model not found: '{path}'. Run src/train.py first."
             )
         with open(path, "rb") as f:
             models[assay] = pickle.load(f)
@@ -86,135 +70,77 @@ def load_models(models_dir: str = DEFAULT_MODELS_DIR) -> dict:
 
 def load_thresholds(report_path: str = DEFAULT_REPORT_PATH) -> dict:
     """
-    Loads per-assay decision thresholds from the training report JSON.
-    These thresholds were selected during training to maximise F1 on the
-    validation set — they are the correct operating points for each model
-    and must not be hardcoded or approximated.
-
-    Returns a simple dict mapping assay name → float threshold, e.g.:
-        { "SR-p53": 0.7621, "SR-ARE": 0.4822, "SR-HSE": 0.7991 }
+    Loads training (F1-optimised) thresholds from the training report.
+    Safety thresholds are defined in reasoner.py — they do not come from
+    training_report.json because they are policy decisions, not statistical
+    outputs of the training process.
     """
     if not os.path.exists(report_path):
         raise FileNotFoundError(
-            f"Training report not found: '{report_path}'\n"
-            f"Run src/train.py first (Phase 3) to generate the report."
+            f"Training report not found: '{report_path}'. Run src/train.py first."
         )
     with open(report_path, "r") as f:
         report = json.load(f)
 
-    thresholds = {}
-    for assay in AGENT_CONFIG:
-        if assay not in report:
-            raise KeyError(
-                f"Assay '{assay}' not found in training report. "
-                f"The report may be from an incomplete training run."
-            )
-        thresholds[assay] = float(report[assay]["threshold"])
-    return thresholds
+    return {
+        assay: float(report[assay]["threshold"])
+        for assay in AGENT_CONFIG
+        if assay in report
+    }
 
 
-# ── Risk Label Assignment ──────────────────────────────────────────────────────
-
-def probability_to_risk_label(probability: float, threshold: float) -> str:
+def load_pipeline(
+    models_dir:  str = DEFAULT_MODELS_DIR,
+    report_path: str = DEFAULT_REPORT_PATH,
+) -> tuple[dict, dict]:
     """
-    Converts a raw probability and its assay-specific decision threshold
-    into a human-readable risk label.
-
-    We use three zones rather than a binary yes/no because the threshold
-    represents the F1-optimal operating point — compounds near the threshold
-    are genuinely uncertain and deserve a 'Borderline' label rather than a
-    confident classification in either direction. This is scientifically
-    more honest and also makes the UI more interpretable.
-
-    The zones are:
-        probability >= threshold + 0.10  →  High Risk
-        probability >= threshold - 0.10  →  Borderline
-        probability <  threshold - 0.10  →  Low Risk
+    Loads models and thresholds once. The Streamlit app should call this
+    once at startup and store results in st.session_state.
     """
-    if probability >= threshold + 0.10:
-        return "High Risk"
-    elif probability >= threshold - 0.10:
-        return "Borderline"
-    else:
-        return "Low Risk"
+    return load_models(models_dir), load_thresholds(report_path)
 
 
-def compute_overall_verdict(agent_results: list[dict]) -> str:
-    """
-    Derives the overall audit verdict from the three per-agent results.
-
-    The logic treats the three checkpoints as independent stress tests:
-    if any single checkpoint returns a high-risk signal, the molecule
-    fails the audit. The maximum probability across all three agents is
-    the most conservative (safest) summary statistic for a screening tool.
-
-    Verdict levels:
-        High Risk  — at least one agent probability >= VERDICT_HIGH_RISK
-        Caution    — at least one agent probability >= VERDICT_CAUTION
-        Cleared    — all agent probabilities below VERDICT_CAUTION
-    """
-    max_prob = max(r["probability"] for r in agent_results)
-
-    if max_prob >= VERDICT_HIGH_RISK:
-        return "High Risk"
-    elif max_prob >= VERDICT_CAUTION:
-        return "Caution"
-    else:
-        return "Cleared"
-
-
-# ── Core Prediction Logic ──────────────────────────────────────────────────────
+# ── Core Prediction ────────────────────────────────────────────────────────────
 
 def predict_single(
-    smiles: str,
-    models: dict,
-    thresholds: dict,
+    smiles:         str,
+    models:         dict,
+    thresholds:     dict,
+    threshold_mode: str  = "safety",   # "safety" for demo, "training" for analysis
+    domain_npz:     str  = DEFAULT_DOMAIN_NPZ,
 ) -> dict:
     """
-    Runs the full three-agent toxicity audit for one SMILES string.
+    Full multi-agent toxicity audit for one SMILES string.
 
-    The function is intentionally side-effect free — it receives all
-    dependencies (models, thresholds) as arguments so it can be called
-    from a Streamlit app, a test harness, or a CLI without any global
-    state. The Streamlit app will load models once, then call this
-    function on every new user input.
+    Returns a structured dict with all agent results, coordinator verdict,
+    structural alerts, domain status, and reason summary.
 
-    Return structure:
-    {
-        "smiles":   str,
-        "valid":    bool,
-        "error":    str | None,
-        "verdict":  str,          # "Cleared" | "Caution" | "High Risk" | "Invalid"
-        "agents": [
-            {
-                "assay":          str,
-                "agent_name":     str,
-                "probability":    float,
-                "threshold":      float,
-                "risk_label":     str,
-                "raw_prediction": int,   # 0 or 1 at the stored threshold
-            },
-            ...  (three entries, one per agent)
-        ],
-        "warnings": [ str, ... ]
-    }
+    threshold_mode:
+        "safety"   — uses sensitivity-oriented thresholds (SAFETY_THRESHOLDS).
+                     Recommended for demo and pre-screening use.
+        "training" — uses the F1-optimised thresholds from training_report.json.
+                     Useful for comparing against Phase 3 metrics.
     """
     result = {
-        "smiles":   smiles,
-        "valid":    False,
-        "error":    None,
-        "verdict":  "Invalid",
-        "agents":   [],
-        "warnings": [],
+        "smiles":          smiles,
+        "valid":           False,
+        "error":           None,
+        "verdict":         "Invalid",
+        "threshold_mode":  threshold_mode,
+        "agents":          [],
+        "coordinator":     {},
+        "structural_alerts": [],
+        "domain":          {},
+        "reason_summary":  "",
+        "warnings":        [],
     }
 
     # ── Step 1: Validate SMILES ────────────────────────────────────────────────
     mol = smiles_to_mol(smiles)
     if mol is None:
         result["error"] = (
-            f"Invalid SMILES string: '{smiles}'. "
-            "RDKit could not parse this molecule. "
-            "Check for typos or unsupported notation."
+            f"Invalid SMILES: '{smiles}'. "
+            "RDKit could not parse this molecule."
         )
         return result
 
@@ -222,137 +148,180 @@ def predict_single(
 
     # ── Step 2: Featurise ──────────────────────────────────────────────────────
     feature_vector = featurise_molecule(mol)
-
     if feature_vector is None:
-        # This should not happen after a valid mol, but we handle it defensively.
-        result["error"] = "Featurisation failed despite a valid SMILES. Check RDKit installation."
+        result["error"] = "Featurisation failed despite valid SMILES."
         result["valid"] = False
         return result
 
-    # XGBoost expects shape (1, n_features) for a single sample.
-    X = feature_vector.reshape(1, -1)
+    X        = feature_vector.reshape(1, -1)
+    fp_bits  = feature_vector[:MORGAN_NBITS]   # first 1024 bits for domain check
 
-    # ── Step 3: Run each agent ─────────────────────────────────────────────────
+    # ── Step 3: Structural alerts ──────────────────────────────────────────────
+    alert_matches = check_structural_alerts(mol)
+    result["structural_alerts"] = alert_matches
+
+    # ── Step 4: Applicability domain check ────────────────────────────────────
+    domain_result = check_domain(fp_bits, npz_path=domain_npz)
+    result["domain"] = domain_result
+
+    if domain_result["low_confidence"]:
+        result["warnings"].append(domain_result["domain_warning"])
+
+    # ── Step 5: Run each agent ─────────────────────────────────────────────────
     agent_results = []
 
     for assay, cfg in AGENT_CONFIG.items():
-        model     = models[assay]
-        threshold = thresholds[assay]
+        model              = models[assay]
+        training_threshold = thresholds[assay]
+        safety_threshold   = SAFETY_THRESHOLDS.get(assay, 0.30)
 
-        # predict_proba returns [[prob_class_0, prob_class_1]]
-        # We take index 1 — the probability of the toxic class.
         probability    = float(model.predict_proba(X)[0, 1])
-        raw_prediction = int(probability >= threshold)
-        risk_label     = probability_to_risk_label(probability, threshold)
+
+        # The active threshold depends on the selected mode.
+        active_threshold = (
+            safety_threshold if threshold_mode == "safety"
+            else training_threshold
+        )
+        raw_prediction = int(probability >= active_threshold)
+
+        # Three-zone label around the active threshold.
+        if probability >= active_threshold + 0.20:
+            risk_label = "High Risk"
+        elif probability >= active_threshold:
+            risk_label = "Borderline"
+        else:
+            risk_label = "Low Risk"
 
         agent_results.append({
-            "assay":          assay,
-            "agent_name":     cfg["agent_name"],
-            "probability":    round(probability, 4),
-            "threshold":      round(threshold, 4),
-            "risk_label":     risk_label,
-            "raw_prediction": raw_prediction,
+            "assay":               assay,
+            "agent_name":          cfg["agent_name"],
+            "probability":         round(probability, 4),
+            "training_threshold":  round(training_threshold, 4),
+            "safety_threshold":    round(safety_threshold, 4),
+            "active_threshold":    round(active_threshold, 4),
+            "threshold_mode":      threshold_mode,
+            "raw_prediction":      raw_prediction,
+            "risk_label":          risk_label,
         })
 
-    result["agents"]  = agent_results
-    result["verdict"] = compute_overall_verdict(agent_results)
+    result["agents"] = agent_results
+
+    # ── Step 6: Coordinator reasoning ─────────────────────────────────────────
+    coordinator = run_coordinator(
+        agent_results  = agent_results,
+        alert_matches  = alert_matches,
+        domain_result  = domain_result,
+        threshold_mode = threshold_mode,
+    )
+
+    result["coordinator"]    = coordinator
+    result["verdict"]        = coordinator["verdict"]
+    result["reason_summary"] = coordinator["reason_summary"]
+
     return result
 
 
 # ── Pretty Printer ─────────────────────────────────────────────────────────────
 
-def print_prediction_result(result: dict) -> None:
-    """
-    Prints a readable audit report to stdout.
-    Used in CLI test mode and for development debugging.
-    The Streamlit UI will consume the raw dictionary instead.
-    """
-    sep = "─" * 68
-    print(f"\n{'═' * 68}")
-    print(f"  ToxPathGuard — Molecular Safety Audit")
-    print(f"{'═' * 68}")
-    print(f"  SMILES  : {result['smiles']}")
-    print(f"  Valid   : {result['valid']}")
+def print_result(result: dict) -> None:
+    """Full formatted audit report for CLI output."""
+    W = 70
+    print(f"\n{'═' * W}")
+    print(f"  ToxPathGuard — Multi-Pathway Molecular Safety Audit")
+    print(f"{'═' * W}")
+    print(f"  SMILES         : {result['smiles']}")
+    print(f"  Valid          : {result['valid']}")
+    print(f"  Threshold mode : {result['threshold_mode']}")
 
     if not result["valid"]:
-        print(f"\n  ERROR   : {result['error']}")
-        print(f"{'═' * 68}\n")
+        print(f"\n  ERROR: {result['error']}")
+        print(f"{'═' * W}\n")
         return
 
-    print(f"  Verdict : {result['verdict']}")
+    coord = result["coordinator"]
+    print(f"  Verdict        : {result['verdict']}")
+    print(f"  Primary concern: {coord.get('primary_concern', '—')}")
 
     if result["warnings"]:
         for w in result["warnings"]:
-            print(f"  WARNING : {w}")
+            print(f"  ⚠  {w}")
 
-    print(f"\n  {sep}")
-    print(f"  {'Agent':<40} {'Prob':>6}  {'Threshold':>10}  {'Label':>12}  {'Raw':>4}")
-    print(f"  {sep}")
-
-    for agent in result["agents"]:
+    # ── Agent table ────────────────────────────────────────────────────────────
+    print(f"\n  {'─' * (W-2)}")
+    print(f"  {'Agent':<40} {'Prob':>6}  {'S-Thresh':>9}  {'Label':>12}  {'Fire':>4}")
+    print(f"  {'─' * (W-2)}")
+    for a in result["agents"]:
         print(
-            f"  {agent['agent_name']:<40} "
-            f"{agent['probability']:>6.4f}  "
-            f"{agent['threshold']:>10.4f}  "
-            f"{agent['risk_label']:>12}  "
-            f"{agent['raw_prediction']:>4}"
+            f"  {a['agent_name']:<40} "
+            f"{a['probability']:>6.4f}  "
+            f"{a['safety_threshold']:>9.4f}  "
+            f"{a['risk_label']:>12}  "
+            f"{a['raw_prediction']:>4}"
         )
 
-    print(f"  {sep}")
-    print(f"\n  Overall verdict: {result['verdict']}")
-    print(f"{'═' * 68}\n")
+    # ── Structural alerts ──────────────────────────────────────────────────────
+    print(f"\n  Structural Alerts ({len(result['structural_alerts'])} matched):")
+    if result["structural_alerts"]:
+        for al in result["structural_alerts"]:
+            print(f"    ✗ {al['name']}")
+            print(f"      {al['description']}")
+    else:
+        print("    ✓ No structural toxicophores detected.")
 
+    # ── Alert–model concordance ────────────────────────────────────────────────
+    conc = coord.get("concordance_label")
+    if conc:
+        print(f"\n  Concordance    : {conc}")
 
-# ── Public Loader (for Streamlit) ──────────────────────────────────────────────
+    # ── Domain ────────────────────────────────────────────────────────────────
+    dom = result["domain"]
+    print(f"\n  Domain status  : {dom.get('domain_status', '—')}  "
+          f"(max Tanimoto: {dom.get('max_similarity', 0):.3f})")
 
-def load_pipeline(
-    models_dir:   str = DEFAULT_MODELS_DIR,
-    report_path:  str = DEFAULT_REPORT_PATH,
-) -> tuple[dict, dict]:
-    """
-    Convenience function for the Streamlit app.
-    Loads models and thresholds once and returns both.
-    The app should call this once at startup (outside any button callback)
-    and store the result in st.session_state to avoid reloading on every run.
+    # ── Reason summary ─────────────────────────────────────────────────────────
+    print(f"\n  Summary:")
+    # Word-wrap the summary at 65 characters for readability.
+    words  = result["reason_summary"].split()
+    line   = "    "
+    for word in words:
+        if len(line) + len(word) + 1 > 67:
+            print(line)
+            line = "    " + word + " "
+        else:
+            line += word + " "
+    if line.strip():
+        print(line)
 
-    Example usage in streamlit_app.py:
-        if "pipeline" not in st.session_state:
-            models, thresholds = load_pipeline()
-            st.session_state.models = models
-            st.session_state.thresholds = thresholds
-
-        result = predict_single(smiles, st.session_state.models,
-                                         st.session_state.thresholds)
-    """
-    models     = load_models(models_dir)
-    thresholds = load_thresholds(report_path)
-    return models, thresholds
+    print(f"\n  Confidence: {coord.get('confidence_note', '')}")
+    print(f"{'═' * W}\n")
 
 
 # ── CLI Test Mode ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="ToxPathGuard Phase 4 — Prediction Layer Test"
+        description="ToxPathGuard Phase 4.1 — Molecular Safety Audit"
     )
+    parser.add_argument("--smiles",  type=str, required=True)
+    parser.add_argument("--models",  type=str, default=DEFAULT_MODELS_DIR)
+    parser.add_argument("--report",  type=str, default=DEFAULT_REPORT_PATH)
     parser.add_argument(
-        "--smiles", type=str, required=True,
-        help="SMILES string to audit (wrap in quotes if it contains brackets)"
-    )
-    parser.add_argument(
-        "--models", type=str, default=DEFAULT_MODELS_DIR,
-        help="Path to models directory (default: models/)"
-    )
-    parser.add_argument(
-        "--report", type=str, default=DEFAULT_REPORT_PATH,
-        help="Path to training_report.json (default: models/training_report.json)"
+        "--mode",
+        type=str,
+        default="safety",
+        choices=["safety", "training"],
+        help="Threshold mode: 'safety' (low FNR) or 'training' (F1-optimal)"
     )
     args = parser.parse_args()
 
-    # Load once, then predict.
-    print("Loading models and thresholds...")
+    print("Loading pipeline...")
     models, thresholds = load_pipeline(args.models, args.report)
-    print("Pipeline loaded.\n")
+    print("Ready.\n")
 
-    result = predict_single(args.smiles, models, thresholds)
-    print_prediction_result(result)
+    result = predict_single(
+        smiles         = args.smiles,
+        models         = models,
+        thresholds     = thresholds,
+        threshold_mode = args.mode,
+    )
+    print_result(result)
