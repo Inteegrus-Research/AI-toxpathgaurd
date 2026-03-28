@@ -29,6 +29,7 @@ from features  import smiles_to_mol, featurise_molecule, feature_names
 from alerts    import check_structural_alerts, has_any_alert
 from domain    import check_domain, MORGAN_NBITS
 from reasoner  import run_coordinator, SAFETY_THRESHOLDS
+from explain   import explain_molecule
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -108,6 +109,7 @@ def predict_single(
     thresholds:     dict,
     threshold_mode: str  = "safety",   # "safety" for demo, "training" for analysis
     domain_npz:     str  = DEFAULT_DOMAIN_NPZ,
+    explain:        bool = True,
 ) -> dict:
     """
     Full multi-agent toxicity audit for one SMILES string.
@@ -217,6 +219,16 @@ def predict_single(
     result["coordinator"]    = coordinator
     result["verdict"]        = coordinator["verdict"]
     result["reason_summary"] = coordinator["reason_summary"]
+
+    # ── Step 7: SHAP explanation ───────────────────────────────────────────────
+    result["explanation"] = {}
+    if explain and result["valid"]:
+        agent_probs = {a["assay"]: a["probability"] for a in agent_results}
+        result["explanation"] = explain_molecule(
+            smiles      = smiles,
+            models      = models,
+            agent_probs = agent_probs,
+        )
 
     return result
 
