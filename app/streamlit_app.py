@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from predict  import load_pipeline, predict_single
 from explain  import explain_molecule, save_shap_bar_chart
+from report   import generate_report   # new import
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -311,6 +312,23 @@ def domain_pill_html(domain_status: str) -> str:
         "Out of Domain":   "domain-out",
     }.get(domain_status, "domain-edge")
     return f'<span class="domain-pill {cls}">{domain_status}</span>'
+
+
+def confidence_badge_html(level: str) -> str:
+    """Renders a small inline confidence badge."""
+    cfg = {
+        "high":   ("🟢", "#4dd9ac", "rgba(77,217,172,0.12)"),
+        "medium": ("🟡", "#f5a623", "rgba(245,166,35,0.12)"),
+        "low":    ("🔴", "#e05c5c", "rgba(224,92,92,0.12)"),
+    }.get(level, ("⚪", "#8b93a8", "rgba(139,147,168,0.12)"))
+    icon, color, bg = cfg
+    label = level.capitalize() + " Confidence"
+    return (
+        f'<span style="display:inline-block; padding:0.15rem 0.7rem; '
+        f'border-radius:12px; font-size:0.75rem; font-family:var(--font-mono); '
+        f'font-weight:600; background:{bg}; color:{color};">'
+        f'{icon} {label}</span>'
+    )
 
 
 def shap_bar_html(
@@ -601,6 +619,28 @@ def main():
                     unsafe_allow_html=True,
                 )
 
+    # ── Confidence badge and download button ───────────────────────────────────
+    conf_level = coordinator.get("confidence_level", "—")
+    report_json = generate_report(result)
+
+    badge_col, dl_col = st.columns([3, 1])
+    with badge_col:
+        st.markdown(
+            f'<div style="margin:0.4rem 0 0.8rem;">'
+            f'{confidence_badge_html(conf_level)}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with dl_col:
+        mol_name_safe = smiles[:20].replace("/", "_").replace("\\", "_")
+        st.download_button(
+            label="⬇ Download Report",
+            data=report_json,
+            file_name=f"toxpathguard_{mol_name_safe}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
     st.markdown("<div style='margin:1rem 0;'></div>", unsafe_allow_html=True)
 
     # ── Three-column agent layout ──────────────────────────────────────────────
@@ -773,6 +813,23 @@ def main():
                     '</div>'
                 )
                 st.markdown(row_html, unsafe_allow_html=True)
+
+    # ── Audit trace expander ──────────────────────────────────────────────────
+    audit_trace = result.get("audit_trace", [])
+    if audit_trace:
+        with st.expander("Audit Trace", expanded=False):
+            st.markdown(
+                '<div class="label-sm" style="margin-bottom:0.6rem;">Step-by-step audit log</div>',
+                unsafe_allow_html=True,
+            )
+            for i, step in enumerate(audit_trace, 1):
+                color = "#e05c5c" if step.startswith("✗") else "#4dd9ac"
+                st.markdown(
+                    f'<div class="mono" style="color:{color}; padding:0.15rem 0; font-size:0.78rem;">'
+                    f'{i:02d}.  {step}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
     # ── Footer ─────────────────────────────────────────────────────────────────
     st.markdown("<div style='margin:2rem 0 0.5rem;'></div>", unsafe_allow_html=True)

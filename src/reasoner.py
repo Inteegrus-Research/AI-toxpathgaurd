@@ -78,6 +78,68 @@ def classify_alert_concordance(
         return None
 
 
+# ── Confidence Level Scoring ───────────────────────────────────────────────────
+
+def compute_confidence_level(
+    agent_results:  list[dict],
+    domain_result:  dict,
+    alert_matches:  list[dict],
+) -> str:
+    """
+    Returns a three-level confidence rating for the overall audit.
+
+    High confidence:
+        - Agents agree (all fire or all clear, not split)
+        - Molecule is in domain
+        - Structural alert result is concordant with model
+
+    Medium confidence:
+        - Partial agent agreement (2/3 agree)
+        - OR mild domain warning (Edge of Domain)
+        - OR alert is present but model score is borderline
+
+    Low confidence:
+        - Strong disagreement between agents (1/3 fire while 2/3 clear)
+        - OR molecule is Out of Domain
+        - OR no alerts but model flags high risk (Novel Risk Motif)
+
+    This is rule-based and deterministic. It does not change the verdict —
+    it is a second-order signal about how much to trust the verdict.
+    """
+    domain_status = domain_result.get("domain_status", "In Domain")
+    n_fired       = sum(1 for r in agent_results if r.get("safety_raw_pred", 0) == 1)
+    has_alerts    = len(alert_matches) > 0
+
+    # Agent agreement
+    all_agree      = (n_fired == 0) or (n_fired == 3)
+    partial_agree  = n_fired in (1, 2)
+
+    # Domain status
+    in_domain      = domain_status == "In Domain"
+    edge_domain    = domain_status == "Edge of Domain"
+    out_domain     = domain_status == "Out of Domain"
+
+    # Alert–model concordance
+    any_high = any(r.get("safety_raw_pred", 0) == 1 for r in agent_results)
+    concordant = (any_high and has_alerts) or (not any_high and not has_alerts)
+
+    # ── Decision logic ─────────────────────────────────────────────────────────
+    if out_domain:
+        return "low"
+
+    if all_agree and in_domain and concordant:
+        return "high"
+
+    if partial_agree and out_domain:
+        return "low"
+
+    if partial_agree or edge_domain or not concordant:
+        return "medium"
+
+    return "high"
+
+
+
 # ── Per-Agent Risk Label (Safety Threshold) ───────────────────────────────────
 
 def apply_safety_threshold(assay: str, probability: float) -> dict:
@@ -269,6 +331,7 @@ def run_coordinator(
     alert_matches:  list[dict],
     domain_result:  dict,
     threshold_mode: str = "safety",
+
 ) -> dict:
     """
     The coordinator entry point. Accepts raw agent outputs and returns
@@ -299,6 +362,7 @@ def run_coordinator(
         "concordance_label":    concordance,
         "reason_summary":       summary,
         "confidence_note":      confidence,
+        "confidence_level":     compute_confidence_level(agent_results, domain_result, alert_matches),
         "threshold_mode":       threshold_mode,
         "safety_thresholds":    SAFETY_THRESHOLDS,
     }

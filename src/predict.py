@@ -107,86 +107,87 @@ def predict_single(
     smiles:         str,
     models:         dict,
     thresholds:     dict,
-    threshold_mode: str  = "safety",   # "safety" for demo, "training" for analysis
+    threshold_mode: str  = "safety",
     domain_npz:     str  = DEFAULT_DOMAIN_NPZ,
     explain:        bool = True,
 ) -> dict:
-    """
-    Full multi-agent toxicity audit for one SMILES string.
 
-    Returns a structured dict with all agent results, coordinator verdict,
-    structural alerts, domain status, and reason summary.
-
-    threshold_mode:
-        "safety"   — uses sensitivity-oriented thresholds (SAFETY_THRESHOLDS).
-                     Recommended for demo and pre-screening use.
-        "training" — uses the F1-optimised thresholds from training_report.json.
-                     Useful for comparing against Phase 3 metrics.
-    """
     result = {
-        "smiles":          smiles,
-        "valid":           False,
-        "error":           None,
-        "verdict":         "Invalid",
-        "threshold_mode":  threshold_mode,
-        "agents":          [],
-        "coordinator":     {},
+        "smiles":            smiles,
+        "valid":             False,
+        "error":             None,
+        "verdict":           "Invalid",
+        "threshold_mode":    threshold_mode,
+        "agents":            [],
+        "coordinator":       {},
         "structural_alerts": [],
-        "domain":          {},
-        "reason_summary":  "",
-        "warnings":        [],
+        "domain":            {},
+        "reason_summary":    "",
+        "explanation":       {},
+        "warnings":          [],
+        "audit_trace":       [],
     }
+    _trace = result["audit_trace"]
 
-    # ── Step 1: Validate SMILES ────────────────────────────────────────────────
+    # ── Step 1: Validate ───────────────────────────────────────────────────────
     mol = smiles_to_mol(smiles)
     if mol is None:
+        _trace.append("✗ SMILES validation failed — molecule could not be parsed")
         result["error"] = (
             f"Invalid SMILES: '{smiles}'. "
             "RDKit could not parse this molecule."
         )
         return result
 
+    _trace.append("✓ SMILES validated successfully")
     result["valid"] = True
 
     # ── Step 2: Featurise ──────────────────────────────────────────────────────
     feature_vector = featurise_molecule(mol)
     if feature_vector is None:
+        _trace.append("✗ Featurisation failed despite valid SMILES")
         result["error"] = "Featurisation failed despite valid SMILES."
         result["valid"] = False
         return result
 
-    X        = feature_vector.reshape(1, -1)
-    fp_bits  = feature_vector[:MORGAN_NBITS]   # first 1024 bits for domain check
+    _trace.append(
+        f"✓ Features generated — Morgan fingerprint (radius=2, 1024-bit) "
+        f"+ 6 physicochemical descriptors = 1030-dimensional vector"
+    )
+    X       = feature_vector.reshape(1, -1)
+    fp_bits = feature_vector[:MORGAN_NBITS]
 
     # ── Step 3: Structural alerts ──────────────────────────────────────────────
     alert_matches = check_structural_alerts(mol)
     result["structural_alerts"] = alert_matches
+    n_alerts = len(alert_matches)
+    _trace.append(
+        f"✓ Structural alert screen complete — "
+        f"{n_alerts} toxicophore pattern(s) matched"
+        + (f": {', '.join(a['name'] for a in alert_matches)}" if n_alerts else "")
+    )
 
-    # ── Step 4: Applicability domain check ────────────────────────────────────
+    # ── Step 4: Applicability domain ───────────────────────────────────────────
     domain_result = check_domain(fp_bits, npz_path=domain_npz)
     result["domain"] = domain_result
-
     if domain_result["low_confidence"]:
         result["warnings"].append(domain_result["domain_warning"])
+    _trace.append(
+        f"✓ Applicability domain checked — {domain_result['domain_status']} "
+        f"(max Tanimoto similarity: {domain_result['max_similarity']:.3f})"
+    )
 
-    # ── Step 5: Run each agent ─────────────────────────────────────────────────
+    # ── Step 5: Agent predictions ──────────────────────────────────────────────
     agent_results = []
-
     for assay, cfg in AGENT_CONFIG.items():
         model              = models[assay]
         training_threshold = thresholds[assay]
         safety_threshold   = SAFETY_THRESHOLDS.get(assay, 0.30)
+        active_threshold   = safety_threshold if threshold_mode == "safety" else training_threshold
 
         probability    = float(model.predict_proba(X)[0, 1])
-
-        # The active threshold depends on the selected mode.
-        active_threshold = (
-            safety_threshold if threshold_mode == "safety"
-            else training_threshold
-        )
         raw_prediction = int(probability >= active_threshold)
 
-        # Three-zone label around the active threshold.
         if probability >= active_threshold + 0.20:
             risk_label = "High Risk"
         elif probability >= active_threshold:
@@ -205,33 +206,42 @@ def predict_single(
             "raw_prediction":      raw_prediction,
             "risk_label":          risk_label,
         })
+        _trace.append(
+            f"✓ {cfg['agent_name']} evaluated — "
+            f"p={probability:.4f}, label={risk_label}"
+        )
 
     result["agents"] = agent_results
 
-    # ── Step 6: Coordinator reasoning ─────────────────────────────────────────
+    # ── Step 6: Coordinator ────────────────────────────────────────────────────
     coordinator = run_coordinator(
         agent_results  = agent_results,
         alert_matches  = alert_matches,
         domain_result  = domain_result,
         threshold_mode = threshold_mode,
     )
-
     result["coordinator"]    = coordinator
     result["verdict"]        = coordinator["verdict"]
     result["reason_summary"] = coordinator["reason_summary"]
+    _trace.append(
+        f"✓ Coordinator verdict generated — {coordinator['verdict']} "
+        f"[confidence: {coordinator.get('confidence_level', '—')}]"
+    )
 
     # ── Step 7: SHAP explanation ───────────────────────────────────────────────
     result["explanation"] = {}
-    if explain and result["valid"]:
+    if explain:
         agent_probs = {a["assay"]: a["probability"] for a in agent_results}
         result["explanation"] = explain_molecule(
             smiles      = smiles,
             models      = models,
             agent_probs = agent_probs,
         )
+        _trace.append("✓ SHAP explanations computed for all three agents")
+    else:
+        _trace.append("— SHAP explanations skipped (explain=False)")
 
     return result
-
 
 # ── Pretty Printer ─────────────────────────────────────────────────────────────
 

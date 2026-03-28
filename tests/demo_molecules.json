@@ -1,0 +1,107 @@
+[
+  {
+    "name": "Ethanol",
+    "smiles": "CCO",
+    "category": "safe",
+    "expected_verdict": "Cleared",
+    "notes": "Simple alcohol. Should clear all three agents cleanly."
+  },
+  {
+    "name": "Glucose",
+    "smiles": "OC[C@H]1OC(O)[C@H](O)[C@@H](O)[C@@H]1O",
+    "category": "safe",
+    "expected_verdict": "Cleared",
+    "notes": "Biological sugar. No toxicophores expected."
+  },
+  {
+    "name": "Paracetamol",
+    "smiles": "CC(=O)Nc1ccc(O)cc1",
+    "category": "borderline",
+    "expected_verdict": "Caution",
+    "notes": "Borderline case. Aromatic amine alert expected. Model-low concordance."
+  },
+  {
+    "name": "Aspirin",
+    "smiles": "CC(=O)Oc1ccccc1C(=O)O",
+    "category": "borderline",
+    "expected_verdict": "Caution",
+    "notes": "Common NSAID. Moderate signals possible."
+  },
+  {
+    "name": "Caffeine",
+    "smiles": "Cn1cnc2c1c(=O)n(c(=O)n2C)C",
+    "category": "borderline",
+    "expected_verdict": "Cleared",
+    "notes": "Widely consumed. Should not flag as high risk."
+  },
+  {
+    "name": "Benzo[a]pyrene",
+    "smiles": "c1ccc2c(c1)cc1ccc3cccc4ccc2c1c34",
+    "category": "high_risk",
+    "expected_verdict": "High Risk",
+    "notes": "Classic PAH genotoxic carcinogen. All three agents should fire."
+  },
+  {
+    "name": "Aniline",
+    "smiles": "c1ccc(N)cc1",
+    "category": "high_risk",
+    "expected_verdict": "Caution",
+    "notes": "Aromatic amine. Alert should fire. Model scores moderate."
+  },
+  {
+    "name": "Nitrobenzene",
+    "smiles": "O=[N+]([O-])c1ccccc1",
+    "category": "alert_heavy",
+    "expected_verdict": "Caution",
+    "notes": "Nitro group on aromatic ring. Structural alert expected."
+  },
+  {
+    "name": "Acrylamide",
+    "smiles": "C=CC(=O)N",
+    "category": "alert_heavy",
+    "expected_verdict": "Caution",
+    "notes": "Michael acceptor. Known food-processing contaminant and probable carcinogen."
+  },
+  {
+    "name": "Cyclophosphamide",
+    "smiles": "ClCCN(CCCl)P1(=O)NCCCO1",
+    "category": "high_risk",
+    "expected_verdict": "High Risk",
+    "notes": "Chemotherapy alkylating agent. Known genotoxic."
+  },
+  {
+    "name": "Large Macrocycle",
+    "smiles": "C1CCCCCCCCCCCCCCCCCCCCC1",
+    "category": "out_of_domain",
+    "expected_verdict": null,
+    "notes": "Large ring system. Likely outside training domain. Domain warning expected."
+  },
+  {
+    "name": "Very Long SMILES",
+    "smiles": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC(=O)OCC(COC(=O)CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC)OC(=O)CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    "category": "out_of_domain",
+    "expected_verdict": null,
+    "notes": "Lipid-like structure. Very high MW. Out-of-domain expected."
+  },
+  {
+    "name": "Random invalid string",
+    "smiles": "this-is-not-a-molecule",
+    "category": "invalid",
+    "expected_verdict": "Invalid",
+    "notes": "Must not crash. Should return clean error."
+  },
+  {
+    "name": "Empty SMILES",
+    "smiles": "",
+    "category": "invalid",
+    "expected_verdict": "Invalid",
+    "notes": "Empty string. Must not crash."
+  },
+  {
+    "name": "Whitespace SMILES",
+    "smiles": "   ",
+    "category": "invalid",
+    "expected_verdict": "Invalid",
+    "notes": "Whitespace only. Must not crash."
+  }
+]
