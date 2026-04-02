@@ -2,7 +2,7 @@
 
 > A fully offline, single-machine molecular pre-screening prototype that evaluates a compound across three independent biological stress pathways and explains its reasoning.
 
-**Built for the Codecure AI Hackathon at IIT (BHU).**
+**Built for the Codecure AI Hackathon at IIT (BHU).Demo: https://youtu.be/j7o_EmAXP8g?si=jZPXUvVJMHGLIchP**
 
 ---
 
